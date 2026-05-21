@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+# generated output (CI builds this fresh; don't commit)
+striper_run_*.html
+site/

@@ -1,0 +1,4 @@
+requests>=2.31
+numpy>=1.26
+matplotlib>=3.8
+folium>=0.16
