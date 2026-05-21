@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """Striped Bass Run Tracker.
 
-Estimates where the annual striped bass (Morone saxatilis) coastal migration
-front is along the US East Coast, with a focus on the Gulf of Maine, by
-combining free, public, near-real-time sources:
+Answers, at a glance, "is the striped bass run near me, and when does it arrive?"
+along the US East Coast (focused on the Gulf of Maine), from free public data:
 
-  1. Sea-surface temperature (NOAA/JPL MUR SST via ERDDAP). The run tracks the
-     ~50 deg F water, so the 50 deg F (10 deg C) isotherm marks the leading edge.
-     A multi-day trail of that isotherm shows the front advancing day by day.
+  1. Sea-surface temperature (NOAA/JPL MUR SST via ERDDAP), drawn as a smooth
+     heatmap centered on 50 deg F -- the temperature the run tracks -- so the
+     leading edge reads as a color break. A single clean 50 deg F line marks it.
   2. Buoy water temperatures (NOAA NDBC, incl. NERACOOS Gulf of Maine moorings)
      -- real, daily, point-truth where satellite SST is coarse nearshore.
-  3. Recent citizen-science sightings (iNaturalist) and a broader historical
-     record set (GBIF) to show where bass actually turn up.
+  3. A plain-English status panel: where the front is, whether run-temp water has
+     reached your area, how fast it is moving, and a rough arrival estimate
+     (extrapolated from the 50 deg F line's recent day-by-day advance).
+  4. Optional detail layers (recent iNaturalist sightings, broader GBIF records),
+     off by default.
 
-Output is an interactive Folium/Leaflet HTML map. This maps the AGGREGATE run
-front, not individual fish -- there is no public live fish-telemetry feed.
+Output is a single self-contained interactive HTML map. This maps the AGGREGATE
+run front, not individual fish -- there is no public live fish-telemetry feed.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import io
@@ -30,10 +33,12 @@ from urllib.parse import quote
 
 import matplotlib
 
-matplotlib.use("Agg")  # headless: we only use the contouring engine, never a window
+matplotlib.use("Agg")  # headless: contouring + image rendering, never a window
+import matplotlib.image as mimg  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import requests  # noqa: E402
+from matplotlib.colors import TwoSlopeNorm  # noqa: E402
 
 # --- constants --------------------------------------------------------------
 
@@ -42,42 +47,39 @@ INAT_BASE = "https://api.inaturalist.org/v1/observations"
 GBIF_BASE = "https://api.gbif.org/v1/occurrence/search"
 NDBC_REALTIME = "https://www.ndbc.noaa.gov/data/realtime2/{}.txt"
 TAXON = "Morone saxatilis"
-MUR_RES_DEG = 0.01  # native MUR grid resolution
+MUR_RES_DEG = 0.01
 
-# Identify ourselves to the public APIs (iNaturalist requests a User-Agent).
 USER_AGENT = "striper-run-tracker (+https://github.com/bmills23/striper-run-tracker)"
 HEADERS = {"User-Agent": USER_AGENT}
 
 F50_C = (50 - 32) * 5 / 9  # 10.0 C  -- leading edge of the run
 F55_C = (55 - 32) * 5 / 9  # ~12.78 C -- core comfort band
+MI_PER_DEG_LAT = 69.0
 
-# Default coverage: Cape Hatteras -> Down East Maine (lat_max 45 includes the
-# eastern Gulf of Maine buoys), the full span of the coastal run.
 DEFAULT_BBOX = (35.0, 45.0, -77.0, -66.0)  # lat_min, lat_max, lon_min, lon_max
 
-# Initial map viewport presets (data is always coast-wide; this is just zoom).
-REGIONS = {
+REGIONS = {  # initial viewport only; data is always coast-wide
     "maine": ([43.6, -68.8], 7),
     "newengland": ([42.0, -70.0], 7),
-    "full": (None, 6),  # None center -> use bbox center
+    "full": (None, 6),
 }
 
 # Curated NOAA NDBC buoys with water-temp sensors along the run, north->south.
-# (name, lat, lon). Dead/MM buoys are skipped at runtime. NERACOOS Gulf of
-# Maine moorings appear here under their NDBC ids (E01=44032, I01=44034, etc.).
+# Dead/MM buoys are skipped at runtime. NERACOOS Gulf of Maine moorings appear
+# here under their NDBC ids (E01=44032, I01=44034, A01=44029, etc.).
 BUOYS = {
     "44027": ("Jonesport, ME (Down East)", 44.273, -67.314),
-    "44034": ("Eastern Maine Shelf (NERACOOS I01)", 44.105, -68.108),
-    "44032": ("Central Maine Shelf (NERACOOS E01)", 43.716, -69.355),
+    "44034": ("Eastern Maine Shelf", 44.105, -68.108),
+    "44032": ("Central Maine Shelf", 43.716, -69.355),
     "44007": ("Portland, ME", 43.525, -70.141),
     "44098": ("Jeffreys Ledge", 42.798, -70.168),
     "44013": ("Boston, MA", 42.346, -70.651),
-    "44029": ("Massachusetts Bay (NERACOOS A01)", 42.318, -70.566),
+    "44029": ("Massachusetts Bay", 42.318, -70.566),
     "44090": ("Cape Cod Bay, MA", 41.840, -70.329),
     "44008": ("Nantucket Shoals", 40.504, -69.248),
     "44017": ("Montauk Point, NY", 40.694, -72.048),
-    "44025": ("Long Island (off Islip), NY", 40.251, -73.164),
-    "44065": ("New York Harbor Entrance", 40.369, -73.703),
+    "44025": ("Long Island (Islip), NY", 40.251, -73.164),
+    "44065": ("New York Harbor", 40.369, -73.703),
     "44066": ("Texas Tower, NJ", 39.584, -72.594),
     "44009": ("Delaware Bay mouth", 38.457, -74.702),
     "44099": ("Cape Henry, VA", 36.915, -75.719),
@@ -115,22 +117,33 @@ class Buoy:
     when: str
 
 
+@dataclass
+class RunStatus:
+    front_text: str
+    home_text: str
+    advance_text: str
+    eta_text: str
+    series: list  # [(date_str, leading_latitude), ...]
+    summary: str
+
+
+def f_temp(c):
+    """Celsius -> Fahrenheit."""
+    return c * 9 / 5 + 32
+
+
 # --- sea-surface temperature ------------------------------------------------
 
 
 def fetch_sst(bbox, date=None, stride_deg=0.05, timeout=120):
-    """Fetch a strided MUR SST grid (deg C) for the bounding box.
-
-    Returns (lats, lons, grid, date_str) where grid[i, j] is the SST at
-    lats[i], lons[j] (NaN over land). ``date`` None -> latest available day.
-    """
+    """Fetch a strided MUR SST grid (deg C). Returns (lats, lons, grid, date_str);
+    grid[i, j] is SST at lats[i], lons[j] (NaN over land). date None -> latest."""
     lat_min, lat_max, lon_min, lon_max = bbox
     stride = max(1, round(stride_deg / MUR_RES_DEG))
     time_sel = "[last]" if date is None else f"[({date}T09:00:00Z)]"
     selector = (
         f"analysed_sst{time_sel}"
-        f"[({lat_min}):{stride}:({lat_max})]"
-        f"[({lon_min}):{stride}:({lon_max})]"
+        f"[({lat_min}):{stride}:({lat_max})][({lon_min}):{stride}:({lon_max})]"
     )
     url = f"{ERDDAP_BASE}?{quote(selector, safe='()[]:.,-')}"
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
@@ -168,28 +181,73 @@ def extract_front(lats, lons, grid, level_c, min_vertices=8):
     return lines
 
 
+def _path_len_deg(seg):
+    a = np.asarray(seg, float)
+    if len(a) < 2:
+        return 0.0
+    d = np.diff(a, axis=0)
+    return float(np.hypot(d[:, 0], d[:, 1]).sum())
+
+
+def keep_longest(lines, n=2):
+    """Keep the n longest segments (the coastal front), drop offshore eddy loops."""
+    return sorted(lines, key=_path_len_deg, reverse=True)[:n]
+
+
+def front_leading_latitude(lines, lon_center, halfwidth=1.0):
+    """Northern extent of the isotherm within lon_center +/- halfwidth (the
+    coastal leading edge), or None."""
+    in_band = [lat for line in lines for (lat, lon) in line
+               if abs(lon - lon_center) <= halfwidth]
+    return max(in_band) if in_band else None
+
+
 def fetch_sst_history(bbox, days, end_date, stride_deg=0.1):
-    """Front trail: 50 deg F isotherm for each of the ``days`` days before
-    ``end_date``. Returns [(date_str, lines), ...] oldest-first."""
+    """[(date_str, 50F lines), ...] for the ``days`` days before ``end_date``."""
     base = dt.date.fromisoformat(end_date)
     out = []
     for d in range(days, 0, -1):
         day = (base - dt.timedelta(days=d)).isoformat()
         try:
-            lats, lons, grid, ds = fetch_sst(bbox, date=day, stride_deg=stride_deg)
-            out.append((ds, extract_front(lats, lons, grid, F50_C)))
-        except Exception as e:  # missing day, transient ERDDAP error -> skip
+            la, lo, g, ds = fetch_sst(bbox, date=day, stride_deg=stride_deg)
+            out.append((ds, extract_front(la, lo, g, F50_C)))
+        except Exception as e:  # missing day / transient error -> skip
             print(f"[history] skip {day}: {e}", file=sys.stderr)
-    print(f"[history] {len(out)}/{days} prior days of 50F front", file=sys.stderr)
+    print(f"[history] {len(out)}/{days} prior days", file=sys.stderr)
     return out
+
+
+def render_sst_png(lats, lons, grid):
+    """SST heatmap as a base64 PNG data URI + map bounds.
+
+    Diverging colormap centered on 50 deg F so the run's leading edge is the
+    natural blue->yellow->red color break. Land/no-data is transparent.
+    """
+    valid = grid[~np.isnan(grid)]
+    vmin = float(np.floor(valid.min())) if valid.size else 0.0
+    vmax = float(np.ceil(valid.max())) if valid.size else 25.0
+    vmin = min(vmin, F50_C - 1)
+    vmax = max(vmax, F50_C + 1)
+    norm = TwoSlopeNorm(vcenter=F50_C, vmin=vmin, vmax=vmax)
+    cmap = matplotlib.colormaps["RdYlBu_r"]
+
+    rgba = cmap(norm(np.ma.masked_invalid(grid)))
+    rgba[np.isnan(grid), 3] = 0.0     # transparent land / no data
+    rgba = rgba[::-1, :, :]           # row 0 -> north, for ImageOverlay
+
+    buf = io.BytesIO()
+    mimg.imsave(buf, rgba, format="png")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    bounds = [[float(lats.min()), float(lons.min())],
+              [float(lats.max()), float(lons.max())]]
+    return uri, bounds
 
 
 # --- buoys ------------------------------------------------------------------
 
 
 def _latest_wtmp(body):
-    """Return (water_temp_C, 'YYYY-MM-DD HH:MMZ') for the most recent valid
-    reading in an NDBC realtime2 file, or (None, None)."""
+    """(water_temp_C, 'YYYY-MM-DD HH:MMZ') for the most recent valid NDBC reading."""
     for line in body.splitlines():
         if line.startswith("#") or not line.strip():
             continue
@@ -210,9 +268,8 @@ def fetch_buoys(bbox, timeout=15):
         if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
             continue
         try:
-            body = requests.get(
-                NDBC_REALTIME.format(bid), headers=HEADERS, timeout=timeout
-            ).text
+            body = requests.get(NDBC_REALTIME.format(bid), headers=HEADERS,
+                                timeout=timeout).text
         except requests.RequestException:
             continue
         wtmp, when = _latest_wtmp(body)
@@ -249,8 +306,7 @@ def fetch_sightings(bbox, days=30, timeout=60, max_results=200):
         out.append(Sighting(
             lat=lat, lon=lon,
             date=r.get("observed_on") or (r.get("time_observed_at") or "")[:10],
-            place=r.get("place_guess") or "",
-            url=r.get("uri") or "",
+            place=r.get("place_guess") or "", url=r.get("uri") or "",
             quality=r.get("quality_grade") or "",
         ))
     print(f"[sightings] {len(out)} recent iNaturalist (last {days}d)", file=sys.stderr)
@@ -258,8 +314,8 @@ def fetch_sightings(bbox, days=30, timeout=60, max_results=200):
 
 
 def fetch_gbif(bbox, years=4, timeout=60, max_records=900):
-    """Broader historical occurrence records from GBIF (aggregates iNaturalist
-    research-grade, museum, and survey/marine datasets incl. OBIS feeds)."""
+    """Broader historical records from GBIF (aggregates iNaturalist research-grade,
+    museum, and survey/marine datasets)."""
     lat_min, lat_max, lon_min, lon_max = bbox
     this_year = dt.date.today().year
     out, offset = [], 0
@@ -291,48 +347,175 @@ def fetch_gbif(bbox, years=4, timeout=60, max_records=900):
     return out
 
 
+# --- status computation -----------------------------------------------------
+
+
+def _sample_grid(lats, lons, grid, lat, lon):
+    """Nearest non-NaN SST (deg C) to (lat, lon), searching a small neighborhood
+    so a coastal/land cell still resolves to nearby water. None if nothing near."""
+    i = int(np.argmin(np.abs(lats - lat)))
+    j = int(np.argmin(np.abs(lons - lon)))
+    if not np.isnan(grid[i, j]):
+        return float(grid[i, j])
+    for r in range(1, 8):
+        sub = grid[max(0, i - r):i + r + 1, max(0, j - r):j + r + 1]
+        if np.any(~np.isnan(sub)):
+            return float(np.nanmean(sub))
+    return None
+
+
+def compute_status(buoys, history, front_50, grid, lats, lons, home, date_str):
+    """Plain-English run status from buoys (front location, home) and the 50F
+    isotherm's day-by-day advance (rate + ETA)."""
+    home_lat, home_lon, home_name = home
+    home_sst = _sample_grid(lats, lons, grid, home_lat, home_lon)
+
+    # Front location, from buoys (most reliable point-truth).
+    warm = [b for b in buoys if b.wtmp_c >= F50_C]
+    cold = [b for b in buoys if b.wtmp_c < F50_C]
+    if not buoys:
+        front_text = "Front: no live buoys available right now."
+    elif not cold:
+        front_text = "Run-temperature water (≥50°F) at every buoy in view."
+    elif not warm:
+        front_text = "Front is south of the area — all buoys still <50°F."
+    else:
+        north_warm = max(warm, key=lambda b: b.lat)
+        colder_north = [b for b in cold if b.lat > north_warm.lat]
+        if colder_north:
+            sc = min(colder_north, key=lambda b: b.lat)
+            front_text = (f"Front between {north_warm.name} "
+                          f"({f_temp(north_warm.wtmp_c):.0f}°F) and {sc.name} "
+                          f"({f_temp(sc.wtmp_c):.0f}°F).")
+        else:
+            front_text = (f"Leading 50°F edge near {north_warm.name} "
+                          f"({f_temp(north_warm.wtmp_c):.0f}°F).")
+
+    # Home status.
+    if home_sst is None:
+        home_text = f"{home_name}: no temperature reading."
+    elif home_sst >= F50_C:
+        home_text = f"{home_name}: {f_temp(home_sst):.0f}°F — run water present ✓"
+    else:
+        home_text = f"{home_name}: {f_temp(home_sst):.0f}°F — not there yet."
+
+    # Leading-latitude series (history + today) along the home's coastal band.
+    series = []
+    for ds, lines in history:
+        la = front_leading_latitude(lines, home_lon)
+        if la is not None:
+            series.append((ds, la))
+    front_lat_now = front_leading_latitude(front_50, home_lon)
+    if front_lat_now is not None:
+        series.append((date_str, front_lat_now))
+
+    rate_mi = None
+    if len(series) >= 2:
+        xs = np.array([dt.date.fromisoformat(d).toordinal() for d, _ in series], float)
+        ys = np.array([la for _, la in series], float)
+        rate_mi = float(np.polyfit(xs, ys, 1)[0]) * MI_PER_DEG_LAT
+
+    if rate_mi is None:
+        advance_text = "Advance rate: not enough data."
+    elif rate_mi > 0.5:
+        advance_text = f"Front advancing ~{rate_mi:.0f} mi/day north."
+    elif rate_mi < -0.5:
+        advance_text = f"Front sliding ~{abs(rate_mi):.0f} mi/day south."
+    else:
+        advance_text = "Front roughly stationary."
+
+    # ETA to home.
+    if home_sst is not None and home_sst >= F50_C:
+        if front_lat_now is not None and front_lat_now > home_lat:
+            d = (front_lat_now - home_lat) * MI_PER_DEG_LAT
+            eta_text = f"Arrived at {home_name}; leading edge now ~{d:.0f} mi north."
+        else:
+            eta_text = f"Run water has arrived at {home_name}."
+    elif (rate_mi and rate_mi > 0.5 and front_lat_now is not None
+          and front_lat_now < home_lat):
+        miles = (home_lat - front_lat_now) * MI_PER_DEG_LAT
+        eta_text = (f"~{miles:.0f} mi south; est. arrival at {home_name} in "
+                    f"~{miles / rate_mi:.0f} days.")
+    else:
+        eta_text = f"No clear northward advance toward {home_name} right now."
+
+    summary = " | ".join([front_text, home_text, advance_text, eta_text])
+    return RunStatus(front_text, home_text, advance_text, eta_text, series, summary)
+
+
 # --- rendering --------------------------------------------------------------
 
 
 def temp_color(c):
-    """Buoy marker color by how the run feels it: cold / arriving / prime."""
+    """Buoy color by how the run feels it: cold / arriving / prime."""
     if c < F50_C:
-        return "#2c7fb8"  # < 50F: too cold, run not here
+        return "#2c7fb8"
     if c < F55_C:
-        return "#fdae61"  # 50-55F: leading edge / arriving
-    return "#d7191c"      # 55F+: prime
+        return "#fdae61"
+    return "#d7191c"
 
 
-def _legend_html(date_str, days, n_inat, n_buoys, n_gbif, n_hist):
+def render_sparkline(series):
+    """Tiny base64 PNG of leading-edge latitude over time (up = moving north)."""
+    if len(series) < 2:
+        return ""
+    xs = [dt.date.fromisoformat(d).toordinal() for d, _ in series]
+    ys = [la for _, la in series]
+    fig, ax = plt.subplots(figsize=(2.9, 0.7), dpi=120)
+    ax.plot(xs, ys, color="#08519c", lw=1.6, marker="o", ms=2.5)
+    ax.fill_between(xs, ys, min(ys), color="#08519c", alpha=0.10)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.margins(0.06)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _status_panel_html(status, date_str, sparkline_uri, n_inat, n_gbif):
+    spark = (
+        f'<img src="{sparkline_uri}" style="width:100%;margin:5px 0 1px;">'
+        f'<div style="color:#888;font-size:10px;">50°F leading-edge latitude '
+        f'(up = moving north)</div>' if sparkline_uri else "")
     return f"""
-    <div style="position: fixed; top: 12px; left: 50px; z-index: 9999;
-        background: white; padding: 10px 14px; border-radius: 8px;
-        box-shadow: 0 1px 5px rgba(0,0,0,.3); font-family: sans-serif;
-        font-size: 12.5px; max-width: 330px; line-height: 1.5;">
-      <b>&#127907; Striped Bass Run Tracker</b> &mdash; SST {date_str}<br>
-      <span style="color:#2c7fb8;font-weight:bold;">&#9473;&#9473;</span>
-        &asymp;50&deg;F isotherm &mdash; leading edge<br>
-      <span style="color:#41b6c4;font-weight:bold;">&#9473;&#9473;</span>
-        &asymp;55&deg;F isotherm &mdash; core band<br>
-      <span style="color:#08519c;">&#9482;&#9482;</span>
-        50&deg;F front trail, last {n_hist}d (faint=older)<br>
-      Buoys ({n_buoys}):
+    <div style="position: fixed; top: 12px; left: 12px; z-index: 9999;
+        background: rgba(255,255,255,.96); padding: 11px 14px; border-radius: 10px;
+        box-shadow: 0 2px 9px rgba(0,0,0,.28); font-family: system-ui, sans-serif;
+        font-size: 13px; max-width: 322px; line-height: 1.45;">
+      <div style="font-weight:700;font-size:14.5px;">&#127907; Striped Bass Run</div>
+      <div style="color:#666;font-size:11px;margin-bottom:7px;">SST {date_str}</div>
+      <div>&#128205; {status.front_text}</div>
+      <div style="margin-top:3px;">&#127968; {status.home_text}</div>
+      <div style="margin-top:3px;">&#10145;&#65039; {status.advance_text}</div>
+      <div style="margin-top:5px;padding:6px 8px;background:#eef5fb;border-radius:6px;
+        font-weight:600;">&#9203; {status.eta_text}</div>
+      {spark}
+      <hr style="border:none;border-top:1px solid #eee;margin:8px 0 7px;">
+      <div style="font-size:11px;">Water temp
+        <span style="display:inline-block;width:130px;height:10px;border-radius:3px;
+          background:linear-gradient(to right,#2c7bb6,#ffffbf,#d7191c);
+          vertical-align:middle;margin-left:4px;"></span></div>
+      <div style="font-size:10px;color:#888;width:160px;display:flex;
+        justify-content:space-between;margin-left:62px;">
+        <span>cold</span><span>50°F</span><span>warm</span></div>
+      <div style="font-size:11px;margin-top:5px;">Buoys
         <span style="color:#2c7fb8;">&#9679;</span>&lt;50
         <span style="color:#fdae61;">&#9679;</span>50&ndash;55
-        <span style="color:#d7191c;">&#9679;</span>55+&deg;F<br>
-      <span style="color:#2ca25f;font-weight:bold;">&#9679;</span>
-        iNaturalist, last {days}d ({n_inat}) &nbsp;
-      <span style="color:#888;font-weight:bold;">&#9679;</span>
-        GBIF records ({n_gbif})<br>
-      <small style="color:#777;">Temperature-proxy + sightings &mdash;
-        <i>not</i> live fish telemetry.</small>
+        <span style="color:#d7191c;">&#9679;</span>55+°F</div>
+      <div style="font-size:10.5px;color:#888;margin-top:4px;">Toggle sightings
+        ({n_inat}) &amp; historical records ({n_gbif}) at top-right.</div>
+      <div style="font-size:10px;color:#aaa;margin-top:5px;">Temperature-proxy
+        estimate &mdash; <i>not</i> live fish telemetry.</div>
     </div>"""
 
 
-def build_map(*, front_50, front_55, history, buoys, sightings, records,
-              bbox, date_str, days, region, out_path):
+def build_map(*, sst_uri, sst_bounds, front_50, history, buoys, sightings,
+              records, status, sparkline_uri, bbox, date_str, region, out_path):
     import folium
     from folium.plugins import MarkerCluster
+    from folium.raster_layers import ImageOverlay
 
     lat_min, lat_max, lon_min, lon_max = bbox
     center, zoom = REGIONS.get(region, REGIONS["full"])
@@ -340,40 +523,36 @@ def build_map(*, front_50, front_55, history, buoys, sightings, records,
         center = [(lat_min + lat_max) / 2, (lon_min + lon_max) / 2]
     m = folium.Map(location=center, zoom_start=zoom, tiles="CartoDB positron")
 
-    # Front trail (oldest faint -> newest darker), drawn first so it sits under.
-    fg_hist = folium.FeatureGroup(name=f"50F front trail ({len(history)}d)", show=True)
-    n = len(history)
-    for i, (_, lines) in enumerate(history):
-        op = 0.12 + 0.38 * (i / max(1, n - 1))
-        for line in lines:
-            folium.PolyLine(line, color="#08519c", weight=2, opacity=op).add_to(fg_hist)
-    fg_hist.add_to(m)
+    ImageOverlay(image=sst_uri, bounds=sst_bounds, opacity=0.65,
+                 name="SST heatmap", show=True).add_to(m)
 
-    fg55 = folium.FeatureGroup(name="~55F isotherm (core)", show=True)
-    for line in front_55:
-        folium.PolyLine(line, color="#41b6c4", weight=3, opacity=0.85).add_to(fg55)
-    fg55.add_to(m)
-
-    fg50 = folium.FeatureGroup(name="~50F isotherm (leading edge)", show=True)
+    fg50 = folium.FeatureGroup(name="50°F front (leading edge)", show=True)
     for line in front_50:
-        folium.PolyLine(line, color="#2c7fb8", weight=5, opacity=0.95).add_to(fg50)
+        folium.PolyLine(line, color="#08306b", weight=4, opacity=0.9).add_to(fg50)
     fg50.add_to(m)
 
-    # Historical records (GBIF) -- clustered, on but visually subtle.
-    fg_gbif = folium.FeatureGroup(name=f"Historical records ({len(records)})", show=True)
-    cl_g = MarkerCluster().add_to(fg_gbif)
-    for r in records:
+    fg_buoy = folium.FeatureGroup(name=f"Buoy water temp ({len(buoys)})", show=True)
+    for b in buoys:
+        f = f_temp(b.wtmp_c)
         popup = folium.Popup(
-            f"<b>Striped bass</b> ({r.year})<br>{r.source}<br>"
-            f"<a href='{r.url}' target='_blank'>GBIF</a>" if r.url else "GBIF record",
-            max_width=240)
-        folium.CircleMarker([r.lat, r.lon], radius=3, color="#888", weight=0,
-                            fill=True, fill_color="#888", fill_opacity=0.55,
-                            popup=popup).add_to(cl_g)
-    fg_gbif.add_to(m)
+            f"<b>Buoy {b.bid}</b> &mdash; {b.name}<br>"
+            f"<b>{b.wtmp_c:.1f}&deg;C / {f:.0f}&deg;F</b><br>{b.when}", max_width=250)
+        folium.CircleMarker([b.lat, b.lon], radius=9, color="#222", weight=1,
+                            fill=True, fill_color=temp_color(b.wtmp_c),
+                            fill_opacity=0.95, popup=popup,
+                            tooltip=f"{f:.0f}°F").add_to(fg_buoy)
+    fg_buoy.add_to(m)
 
-    # Recent iNaturalist sightings -- clustered, prominent.
-    fg_inat = folium.FeatureGroup(name=f"Recent sightings ({len(sightings)})", show=True)
+    # --- detail layers, off by default ---
+    fg_trail = folium.FeatureGroup(name=f"50°F trail, raw ({len(history)}d)", show=False)
+    n = len(history)
+    for i, (_, lines) in enumerate(history):
+        op = 0.10 + 0.35 * (i / max(1, n - 1))
+        for line in lines:
+            folium.PolyLine(line, color="#08519c", weight=1.5, opacity=op).add_to(fg_trail)
+    fg_trail.add_to(m)
+
+    fg_inat = folium.FeatureGroup(name=f"Recent sightings ({len(sightings)})", show=False)
     cl_i = MarkerCluster().add_to(fg_inat)
     for s in sightings:
         popup = folium.Popup(
@@ -384,22 +563,21 @@ def build_map(*, front_50, front_55, history, buoys, sightings, records,
                             popup=popup).add_to(cl_i)
     fg_inat.add_to(m)
 
-    # Live buoy water temps -- the real Gulf of Maine signal.
-    fg_buoy = folium.FeatureGroup(name=f"Buoy water temp ({len(buoys)})", show=True)
-    for b in buoys:
-        f = b.wtmp_c * 9 / 5 + 32
+    fg_gbif = folium.FeatureGroup(name=f"Historical records ({len(records)})", show=False)
+    cl_g = MarkerCluster().add_to(fg_gbif)
+    for r in records:
         popup = folium.Popup(
-            f"<b>Buoy {b.bid}</b> &mdash; {b.name}<br>"
-            f"<b>{b.wtmp_c:.1f}&deg;C / {f:.0f}&deg;F</b><br>{b.when}", max_width=250)
-        folium.CircleMarker([b.lat, b.lon], radius=9, color="#222", weight=1,
-                            fill=True, fill_color=temp_color(b.wtmp_c),
-                            fill_opacity=0.95, popup=popup,
-                            tooltip=f"{f:.0f}°F").add_to(fg_buoy)
-    fg_buoy.add_to(m)
+            (f"<b>Striped bass</b> ({r.year})<br>{r.source}<br>"
+             f"<a href='{r.url}' target='_blank'>GBIF</a>") if r.url else "GBIF record",
+            max_width=240)
+        folium.CircleMarker([r.lat, r.lon], radius=3, color="#888", weight=0,
+                            fill=True, fill_color="#888", fill_opacity=0.55,
+                            popup=popup).add_to(cl_g)
+    fg_gbif.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
-    m.get_root().html.add_child(folium.Element(_legend_html(
-        date_str, days, len(sightings), len(buoys), len(records), len(history))))
+    m.get_root().html.add_child(folium.Element(_status_panel_html(
+        status, date_str, sparkline_uri, len(sightings), len(records))))
 
     out_dir = os.path.dirname(out_path)
     if out_dir:
@@ -420,11 +598,13 @@ def main(argv=None):
                    default=list(DEFAULT_BBOX), help="data bounding box")
     p.add_argument("--region", choices=sorted(REGIONS), default="maine",
                    help="initial map viewport (default: maine)")
+    p.add_argument("--home-lat", type=float, default=43.6, help="your-area latitude")
+    p.add_argument("--home-lon", type=float, default=-70.1, help="your-area longitude")
+    p.add_argument("--home-name", default="Portland, ME", help="your-area label")
     p.add_argument("--days", type=int, default=30, help="iNaturalist lookback (days)")
     p.add_argument("--history-days", type=int, default=10,
-                   help="prior days of 50F front trail (0 to disable)")
-    p.add_argument("--gbif-years", type=int, default=4,
-                   help="historical GBIF record window (years; 0 to disable)")
+                   help="prior days used for advance rate / sparkline")
+    p.add_argument("--gbif-years", type=int, default=4, help="GBIF window (years)")
     p.add_argument("--stride", type=float, default=0.05, help="SST spacing (deg)")
     p.add_argument("--out", help="output HTML path")
     args = p.parse_args(argv)
@@ -432,18 +612,24 @@ def main(argv=None):
     bbox = tuple(args.bbox)
     print("[sst] fetching latest SST grid...", file=sys.stderr)
     lats, lons, grid, date_str = fetch_sst(bbox, date=args.date, stride_deg=args.stride)
-    front_50 = extract_front(lats, lons, grid, F50_C)
-    front_55 = extract_front(lats, lons, grid, F55_C)
+    front_50 = keep_longest(extract_front(lats, lons, grid, F50_C), n=2)
+    sst_uri, sst_bounds = render_sst_png(lats, lons, grid)
     history = (fetch_sst_history(bbox, args.history_days, date_str)
                if args.history_days > 0 else [])
     buoys = fetch_buoys(bbox)
     sightings = fetch_sightings(bbox, days=args.days)
     records = fetch_gbif(bbox, years=args.gbif_years) if args.gbif_years > 0 else []
 
+    home = (args.home_lat, args.home_lon, args.home_name)
+    status = compute_status(buoys, history, front_50, grid, lats, lons, home, date_str)
+    print("[status] " + status.summary, file=sys.stderr)
+    sparkline_uri = render_sparkline(status.series)
+
     out_path = args.out or f"striper_run_{date_str}.html"
-    build_map(front_50=front_50, front_55=front_55, history=history, buoys=buoys,
-              sightings=sightings, records=records, bbox=bbox, date_str=date_str,
-              days=args.days, region=args.region, out_path=out_path)
+    build_map(sst_uri=sst_uri, sst_bounds=sst_bounds, front_50=front_50,
+              history=history, buoys=buoys, sightings=sightings, records=records,
+              status=status, sparkline_uri=sparkline_uri, bbox=bbox,
+              date_str=date_str, region=args.region, out_path=out_path)
     print(out_path)
 
 

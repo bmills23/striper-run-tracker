@@ -8,21 +8,28 @@ as an interactive map.
 
 The coastal run tracks water temperature: bass follow the **~50 °F** water north
 in spring and south in fall. So instead of (impossibly) tracking individual
-fish, this tool maps the **50 °F isotherm** as a proxy for the leading edge of
-the run, draws a multi-day **trail** of that line so you can watch it advance,
-and overlays real **buoy water temps** plus sightings to ground-truth it.
+fish, this tool reads that signal and answers, in plain English, **"is the run
+near me, and when does it arrive?"**
 
-| Layer | Source | Notes |
-|-------|--------|-------|
-| Sea-surface temperature + 50 °F front | [NOAA/JPL MUR SST](https://coastwatch.pfeg.noaa.gov/erddap/griddap/jplMURSST41.html) via ERDDAP | ~1 km native; sampled to ~3.5 mi |
-| 50 °F front trail (last N days) | same | one isotherm per prior day, faded oldest→newest |
-| Buoy water temps | [NOAA NDBC](https://www.ndbc.noaa.gov/) realtime (incl. NERACOOS Gulf of Maine moorings) | live, color-coded above/below 50 °F |
-| Recent sightings | [iNaturalist API](https://api.inaturalist.org/v1/docs/) | geotagged, last 30 days |
-| Historical records | [GBIF API](https://www.gbif.org/developer/occurrence) | last 4 yrs; aggregates museum/survey/iNat data |
+A **status panel** does the interpreting for you — front location, whether
+run-temperature water has reached your area, how fast it's moving, and a rough
+arrival estimate — over a clean map you can read at a glance.
 
-The Gulf of Maine buoys are the most actionable layer for the Maine run: when
-the Portland buoy crosses 50 °F while Down East is still cold, the front is
-arriving — something iNaturalist's sparse Maine coverage can't show.
+| Element | Source | Shown by default |
+|---------|--------|------------------|
+| **Status panel** (front location, your-area status, advance rate, ETA, trend sparkline) | computed from buoys + SST | yes |
+| **SST heatmap** — diverging color centered on 50 °F, so the front is the color break | [NOAA/JPL MUR SST](https://coastwatch.pfeg.noaa.gov/erddap/griddap/jplMURSST41.html) via ERDDAP (~1 km, sampled to ~3.5 mi) | yes |
+| **50 °F front line** — single clean leading edge (longest segments only) | same SST | yes |
+| **Buoy water temps** — color-coded above/below 50 °F | [NOAA NDBC](https://www.ndbc.noaa.gov/) realtime (incl. NERACOOS Gulf of Maine moorings) | yes |
+| 50 °F trail (raw daily lines) | same SST | toggle |
+| Recent sightings | [iNaturalist API](https://api.inaturalist.org/v1/docs/), last 30 days | toggle |
+| Historical records | [GBIF API](https://www.gbif.org/developer/occurrence), last 4 yrs (aggregates museum/survey/iNat) | toggle |
+
+The advance rate and ETA are extrapolated from how far the 50 °F line moved over
+the last `--history-days` days along your area's coastal band — a rough estimate,
+clearly labeled, not a forecast. The Gulf of Maine buoys are the most actionable
+real signal for the Maine run (e.g. Portland crossing 50 °F while Down East is
+still cold), which iNaturalist's sparse Maine coverage can't show.
 
 **Honest scope:** this maps the *aggregate* run front, not individual fish.
 There is no public live fish-telemetry feed (acoustic-tag data in ACT / MATOS /
@@ -45,12 +52,17 @@ open striper_run_*.html
 --date YYYY-MM-DD     specific SST day (default: latest available)
 --bbox LATMIN LATMAX LONMIN LONMAX   default: 35 45 -77 -66
 --region NAME         initial viewport: maine | newengland | full (default: maine)
+--home-lat / --home-lon / --home-name   "your area" for the status panel ETA
+                       (default: Portland, ME @ 43.6, -70.1)
 --days N              iNaturalist sighting lookback (default: 30)
---history-days N      prior days of 50 °F front trail (default: 10, 0 disables)
+--history-days N      prior days used for advance rate / sparkline (default: 10)
 --gbif-years N        historical record window in years (default: 4, 0 disables)
 --stride DEG          SST sample spacing in degrees (default: 0.05 ~ 3.5 mi)
 --out PATH            output HTML path
 ```
+
+Set `--home-*` to your launch spot to personalize the arrival readout, e.g. Down
+East: `--home-lat 44.27 --home-lon -67.31 --home-name "Jonesport"`.
 
 ## Deployment
 
