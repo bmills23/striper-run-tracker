@@ -42,6 +42,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import requests  # noqa: E402
 from matplotlib.colors import Normalize, TwoSlopeNorm  # noqa: E402
+from requests.adapters import HTTPAdapter  # noqa: E402
+from urllib3.util.retry import Retry  # noqa: E402
 from scipy.interpolate import RegularGridInterpolator  # noqa: E402
 from scipy.ndimage import distance_transform_edt, gaussian_filter  # noqa: E402
 from scipy.spatial import cKDTree  # noqa: E402
@@ -58,8 +60,28 @@ NDBC_REALTIME = "https://www.ndbc.noaa.gov/data/realtime2/{}.txt"
 TAXON = "Morone saxatilis"
 MUR_RES_DEG = 0.01
 
-USER_AGENT = "striper-run-tracker (+https://github.com/bmills23/striper-run-tracker)"
-HEADERS = {"User-Agent": USER_AGENT}
+USER_AGENT = ("Mozilla/5.0 (compatible; striper-run-tracker/1.0; "
+              "+https://github.com/bmills23/striper-run-tracker)")
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "text/csv, application/json, */*"}
+
+
+def _make_session():
+    """HTTP session with browser-like headers and retries+backoff. NOAA ERDDAP
+    sits behind a WAF that intermittently 403s datacenter (CI) IPs; retrying
+    almost always gets through, and this also rides out transient API hiccups."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(total=5, connect=3, read=3, status=5,
+                  status_forcelist=(403, 408, 425, 429, 500, 502, 503, 504),
+                  backoff_factor=1.5, raise_on_status=False,
+                  allowed_methods=frozenset(["GET"]))
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+SESSION = _make_session()
 
 F50_C = (50 - 32) * 5 / 9
 F55_C = (55 - 32) * 5 / 9
@@ -165,7 +187,7 @@ def fetch_sst(bbox, date=None, stride_deg=0.05, timeout=120):
     time_sel = "[last]" if date is None else f"[({date}T09:00:00Z)]"
     selector = (f"analysed_sst{time_sel}"
                 f"[({lat_min}):{stride}:({lat_max})][({lon_min}):{stride}:({lon_max})]")
-    resp = requests.get(f"{ERDDAP_SST}?{quote(selector, safe='()[]:.,-')}",
+    resp = SESSION.get(f"{ERDDAP_SST}?{quote(selector, safe='()[]:.,-')}",
                         headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
     rows = list(csv.reader(io.StringIO(resp.text)))[2:]
@@ -258,7 +280,7 @@ def fetch_chl(bbox, sst_lats, sst_lons, timeout=120, stride=4):
     sel = (f"chlorophyll[last]"
            f"[({lat_min}):{stride}:({lat_max})][({lon_min}):{stride}:({lon_max})]")
     try:
-        resp = requests.get(f"{ERDDAP_CHL}?{quote(sel, safe='()[]:.,-')}",
+        resp = SESSION.get(f"{ERDDAP_CHL}?{quote(sel, safe='()[]:.,-')}",
                             headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
         rows = list(csv.reader(io.StringIO(resp.text)))[2:]
@@ -314,7 +336,7 @@ def fetch_buoys(bbox, timeout=15):
         if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
             continue
         try:
-            body = requests.get(NDBC_REALTIME.format(bid), headers=HEADERS,
+            body = SESSION.get(NDBC_REALTIME.format(bid), headers=HEADERS,
                                 timeout=timeout).text
         except requests.RequestException:
             continue
@@ -335,7 +357,7 @@ def fetch_sightings(bbox, days=30, timeout=60, max_results=200):
               "per_page": str(max_results), "order_by": "observed_on",
               "order": "desc", "d1": since, "swlat": lat_min, "swlng": lon_min,
               "nelat": lat_max, "nelng": lon_max}
-    resp = requests.get(INAT_BASE, params=params, headers=HEADERS, timeout=timeout)
+    resp = SESSION.get(INAT_BASE, params=params, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
     out = []
     for r in resp.json().get("results", []):
@@ -367,7 +389,7 @@ def fetch_gbif_seasonal(bbox, month_pad=1, timeout=60, max_records=1500):
                   "decimalLatitude": f"{lat_min},{lat_max}",
                   "decimalLongitude": f"{lon_min},{lon_max}",
                   "month": f"{lo},{hi}", "limit": "300", "offset": str(offset)}
-        resp = requests.get(GBIF_BASE, params=params, headers=HEADERS, timeout=timeout)
+        resp = SESSION.get(GBIF_BASE, params=params, headers=HEADERS, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         for r in data.get("results", []):
