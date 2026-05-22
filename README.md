@@ -42,8 +42,17 @@ available):
 | Bait (chlorophyll) | 0.10 | **opt-in** `--bait`; the readily-available Atlantic chlorophyll product is aging, so it's experimental and off by default |
 
 The advance rate and ETA are extrapolated from how far the 50 °F line moved over
-the last `--history-days` days along your area's coastal band — rough, clearly
+the last `--timeline-days` days along your area's coastal band — rough, clearly
 labeled, not a forecast.
+
+### Scrubbing back two weeks
+
+A slider (with a **play** button) at the bottom scrubs the **probability heatmap
+and 50 °F front** back through the last `--timeline-days` days (default 14), so you
+can watch the pattern and the front advance day by day. All days share one color
+scale, so brightness is comparable across the fortnight. The latest day is the
+default view; buoys, sightings, and the status panel always reflect *current*
+conditions.
 
 ### Inspecting the map
 
@@ -89,7 +98,7 @@ open striper_run_*.html
 --home-lat / --home-lon / --home-name   "your area" for the status panel ETA
                        (default: Portland, ME @ 43.6, -70.1)
 --days N              iNaturalist sighting lookback (default: 30)
---history-days N      prior days used for advance rate / sparkline (default: 10)
+--timeline-days N     days in the scrub-back slider + advance rate (default: 14)
 --stride DEG          SST sample spacing in degrees (default: 0.05 ~ 3.5 mi)
 --bait                add experimental chlorophyll factor (data source is aging)
 --out PATH            output HTML path
